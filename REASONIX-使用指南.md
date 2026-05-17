@@ -200,7 +200,7 @@ node index.js
 
 ### 7.3 重启 Codex
 
-保存配置后重启 Codex，它应该自动拉起 Reasonix 桥接器并发现 `delegate_to_reasonix` 工具。
+保存配置后重启 Codex，它应该自动拉起 Reasonix 桥接器并发现 `execute_task` 工具。
 
 ---
 
@@ -220,7 +220,7 @@ mcp-bridge-reasonix v0.16.0  [structured errors + token budget]
 在 Codex 中尝试：
 
 ```
-请使用 delegate_to_reasonix 工具，帮我执行 pwd 命令。
+请使用 execute_task 工具，帮我执行 pwd 命令。
 ```
 
 如果配置正确，Codex 会调用 bridge 并返回当前工作目录。
@@ -237,7 +237,7 @@ mcp-bridge-reasonix v0.16.0  [structured errors + token budget]
 请读取当前目录下的 index.js 文件，告诉我它的功能概要。
 ```
 
-Codex 会调用 `delegate_to_reasonix` → bridge 调用 DeepSeek → DeepSeek 调 `read_file` → 返回内容。
+Codex 会调用 `execute_task` → bridge 调用 DeepSeek → DeepSeek 调 `read_file` → 返回内容。
 
 ### 示例 2：代码搜索
 

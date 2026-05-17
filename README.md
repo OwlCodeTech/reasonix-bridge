@@ -2,7 +2,7 @@
 
 **Codex ↔ DeepSeek MCP Bridge — 在本地执行复杂任务的多智能体引擎**
 
-Codex 通过 MCP 协议将任务委托给 DeepSeek，在本地沙箱中安全地读、写、查、改代码。支持二阶段执行、多智能体并行、增量模式、动态预算。
+Codex 通过 MCP 协议将任务委托给 DeepSeek，文件工具受 WORKSPACE_ROOT 限制；命令工具按模式限制，但不是强隔离沙箱。支持二阶段执行、多智能体并行、增量模式、动态预算。
 
 ---
 
@@ -21,7 +21,7 @@ cp .env.example .env
 
 ```env
 DEEPSEEK_API_KEY=sk-your-key-here
-REASONIX_COMMAND_MODE=full
+REASONIX_COMMAND_MODE=static
 ```
 
 > `.env` 已被 `.gitignore` 排除，不会泄露密钥。
@@ -44,7 +44,7 @@ node index.js
       "args": ["/path/to/index.js"],
       "env": {
         "DEEPSEEK_API_KEY": "sk-your-key-here",
-        "REASONIX_COMMAND_MODE": "full"
+        "REASONIX_COMMAND_MODE": "static"
       }
     }
   }
@@ -61,7 +61,7 @@ node index.js
 | `plan_task` | 只出计划，不执行 | 先看方案再动手 |
 | `execute_step` | 执行指定的一步 | 配合 plan_task |
 | `orchestrate_task` | 强制多智能体并行 | 明确需要分工时 |
-| `improve_file` | **提想法，DeepSeek 改代码，Codex 不要自己动手** | Codex 发现需要改的地方时 |
+| `improve_file` | **DeepSeek 定向修复工具；Codex/Bridge 保留接管权** | Codex 发现需要改的地方时 |
 | `delegate_to_reasonix` | 旧版一键执行 | 兼容旧用法 |
 
 ### 使用示例
@@ -168,9 +168,10 @@ Phase 2：逐步骤执行 / 多智能体并行（每步独立上下文）
 | **命令分级** | 5 级授权，`full` 模式才允许写操作 |
 | **预算控制** | `REASONIX_MAX_TOKENS` 硬上限，超限优雅停止 |
 | **Token 隔离** | `.gitignore` 已排除 `.env` 和 API Key 文件 |
-| **`improve_file`** | Codex 只提想法，DeepSeek 执行修改，避免误操作 |
+| **`improve_file`** | DeepSeek 定向修复工具；失败或不满足要求时 Codex 可直接接管 |
 
 > ⚠️ `run_command` 子进程不受 JS 沙箱约束，可读任意文件和环境变量。
+> ⚠️ `force:true` 跳过 hash 检查直接覆盖已存在文件，仅用户明确要求时使用，不建议模型自动触发。
 
 ---
 

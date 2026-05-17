@@ -6,7 +6,7 @@
       "env": {
         "DEEPSEEK_API_KEY": "sk-your-key-here",
         "REASONIX_COMMAND_MODE": "static",
-        "WORKSPACE_ROOT": "F:\\mcp\\mcp-bridge-deepseek"
+        "WORKSPACE_ROOT": "F:\\your-project"
       }
     }
   }

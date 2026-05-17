@@ -45,7 +45,7 @@ if (!_realRoot) { console.error("[FATAL] WORKSPACE_ROOT does not exist."); proce
 if (!statSync(_realRoot).isDirectory()) { console.error("[FATAL] WORKSPACE_ROOT not a directory."); process.exit(1); }
 const WORKSPACE_ROOT = _realRoot;
 
-const MAX_TOOL_TURNS     = 50;
+const MAX_TOOL_TURNS     = 20;
 const FETCH_TIMEOUT_MS   = 180_000;
 const MAX_RETRIES        = 3;
 const COMMAND_TIMEOUT_MS = 60_000;
@@ -56,24 +56,37 @@ const MAX_SEARCH_RESULTS = 200;
 const MAX_GLOB_RESULTS   = 200;
 const MAX_PATTERN_LENGTH = 200;
 const MAX_ARG_LENGTH     = 1000;
-const _maxTokensRaw = parseInt(process.env.REASONIX_MAX_TOKENS || "300000");
-const MAX_TOTAL_TOKENS  = Number.isFinite(_maxTokensRaw) && _maxTokensRaw > 0 ? _maxTokensRaw : 300000;
+const crypto = await import("node:crypto");
+
+const _maxTokensRaw = parseInt(process.env.REASONIX_MAX_TOKENS || "64000");
+const MAX_TOTAL_TOKENS  = Number.isFinite(_maxTokensRaw) && _maxTokensRaw > 0 ? _maxTokensRaw : 64000;
+const AGENT_MAX_TURNS   = parseInt(process.env.REASONIX_AGENT_MAX_TURNS || "10");
+const CALL_MAX_TOKENS   = parseInt(process.env.REASONIX_CALL_MAX_TOKENS || "8000");
 
 // --- 规划模式 system prompt ---
 const PLANNING_PROMPT = `你是一个严谨的软件架构师。请将用户的任务分解为**具体的、可执行的步骤**。
 
 输出要求：返回纯 JSON 数组，不要加 markdown 包裹。
-每个步骤包含："id", "file", "action", "depends_on"。
+每个步骤包含：
+- "id": 编号
+- "role": 角色（backend/frontend/database）
+- "action": 做什么
+- "read_files": 需要读取的文件列表
+- "write_files": 需要写入的文件列表
+- "depends_on": 依赖的步骤 id 列表
+- "verify": 验证命令列表
 
 规则：
-- 每个步骤只操作 1 个文件
+- 每个步骤只写入 1~2 个文件
 - 先写依赖文件，再写被依赖文件
-- 每个步骤完成后可以用 run_command/tsc/node --check 验证
+- 多个步骤写入同一文件时必须串行（通过 depends_on 表达）
 - 步骤数量控制在 3~10 个
 - 最后一步是组装/验证
 
 示例输出：
-[{"id":1,"file":"src/models/user.py","action":"创建用户模型","depends_on":[]},{"id":2,"file":"src/routes.py","action":"创建 API 路由","depends_on":[1]}]
+[{"id":1,"role":"backend","action":"创建用户模型","read_files":[],"write_files":["src/models/user.py"],"depends_on":[],"verify":["node --check src/models/user.py"]},{"id":2,"role":"backend","action":"创建 API 路由","read_files":["src/models/user.py"],"write_files":["src/routes/user.py"],"depends_on":[1],"verify":["node --check src/routes/user.py"]}]
+
+向后兼容：也可以用旧的 "file" 字段代替 "write_files"。
 
 请输出 JSON：`;
 
@@ -112,34 +125,88 @@ const ORCHESTRATOR_PROMPT = `你是一个项目拆解专家。请将用户的任
 ## 输出要求
 返回纯 JSON 数组，每个元素：
 - "role": 角色（backend/frontend/database/api/test）
-- "action": 该子智能体做什么
-- "files": 要创建/修改的文件列表
+- "action": 做什么
+- "write_files": 要写入的文件列表
+- "read_files" 要读取的文件列表（可选）
 - "depends_on": 依赖的子任务序号（从0开始）
 
 ## 规则
 - 即使任务只涉及一个领域（比如只有后端），如果功能模块多（>3个独立功能），
-  也应该拆成多个同角色的子任务，例如 Dijkstra-A、Dijkstra-B
-- 每个子任务只负责 1~2 个文件
+  也应该拆成多个同角色的子任务
+- 每个子任务只写入 1~2 个文件
 - 无依赖的子任务可以并行执行
+- 写入同一文件的任务必须串行（通过 depends_on 表达）
 - 总子任务数控制在 3~6 个
 
 ## 示例（跨领域）
-[{"role":"backend","action":"创建用户模型和 API 接口","files":["models/user.py","routes/user.py"],"depends_on":[]},
- {"role":"frontend","action":"创建用户列表页面","files":["pages/UserList.tsx"],"depends_on":[0]},
- {"role":"database","action":"设计用户表结构","files":["schema.sql","migrations/"],"depends_on":[0]}]
+[{"role":"backend","action":"创建用户模型和 API 接口","write_files":["models/user.py","routes/user.py"],"depends_on":[]},
+ {"role":"frontend","action":"创建用户列表页面","write_files":["pages/UserList.tsx"],"depends_on":[0]},
+ {"role":"database","action":"设计用户表结构","write_files":["schema.sql"],"depends_on":[0]}]
 
 ## 示例（单领域复杂）
-[{"role":"backend","action":"实现用户认证模块","files":["backend/auth/login.py","backend/auth/register.py"],"depends_on":[]},
- {"role":"backend","action":"实现文章 CRUD","files":["backend/articles/models.py","backend/articles/routes.py"],"depends_on":[]},
- {"role":"backend","action":"实现文件上传模块","files":["backend/upload/handler.py"],"depends_on":[]}]
+[{"role":"backend","action":"实现用户认证模块","write_files":["backend/auth/login.py","backend/auth/register.py"],"depends_on":[]},
+ {"role":"backend","action":"实现文章 CRUD","write_files":["backend/articles/models.py","backend/articles/routes.py"],"depends_on":[]}]
 
 请输出 JSON：`;
+
+// =========================================================================
+//  Plan 规范化 + Schema 校验
+// =========================================================================
+function normalizePlan(plan) {
+  if (!Array.isArray(plan)) return;
+  for (var pi = 0; pi < plan.length; pi++) {
+    const p = plan[pi];
+    if (!p.write_files && p.file) p.write_files = [p.file];
+    if (!p.write_files && p.files) p.write_files = p.files;
+    if (!p.write_files) p.write_files = [];
+    if (!p.read_files) p.read_files = [];
+    if (!p.verify) p.verify = [];
+    // 兼容指针同步
+    p.files = p.write_files;
+  }
+}
+
+function validatePlan(plan) {
+  if (!Array.isArray(plan)) return "Plan must be an array";
+  var ids = {};
+  for (var i = 0; i < plan.length; i++) {
+    const s = plan[i];
+    if (s.id === undefined || s.id === null) return "Step " + i + " missing id";
+    if (ids[s.id]) return "Duplicate step id: " + s.id;
+    ids[s.id] = true;
+    if (s.depends_on) {
+      for (var d of s.depends_on) { if (!ids[d]) return "Step " + s.id + " depends_on unknown step " + d; }
+    }
+    if (s.write_files) {
+      for (var f of s.write_files) {
+        if (f.includes("..")) return "Step " + s.id + " write_file path escapes: " + f;
+        try { sandboxPath(f); } catch (e) { return "Step " + s.id + " write_file invalid: " + f + " (" + e.message + ")"; }
+      }
+    }
+  }
+  for (var a = 0; a < plan.length; a++) {
+    for (var b = a + 1; b < plan.length; b++) {
+      if (!plan[a].write_files || !plan[b].write_files) continue;
+      // 检查是否有任意方向的依赖（有依赖 = 串行，安全）
+      var aDependsB = plan[a].depends_on && plan[a].depends_on.includes(plan[b].id);
+      var bDependsA = plan[b].depends_on && plan[b].depends_on.includes(plan[a].id);
+      if (aDependsB || bDependsA) continue; // 有依赖关系，安全
+      // 无依赖关系 = 可能并行执行 → 检查 write_files 冲突
+      for (var fa of plan[a].write_files) {
+        for (var fb of plan[b].write_files) {
+          if (fa === fb) return "Steps " + plan[a].id + " and " + plan[b].id + " both write " + fa + " but have no dependency (would run in parallel)";
+        }
+      }
+    }
+  }
+  return null;
+}
 
 // -----------------------------------------------------------------------
 //  Command mode: off | readonly | static | verify | full
 // -----------------------------------------------------------------------
 
-const COMMAND_MODE = (process.env.REASONIX_COMMAND_MODE || "").toLowerCase();
+const COMMAND_MODE = (process.env.REASONIX_COMMAND_MODE || "static").toLowerCase();
 const _lac = process.env.REASONIX_ALLOW_COMMANDS === "1";
 const _law = process.env.REASONIX_ALLOW_WRITE === "1";
 
@@ -477,7 +544,8 @@ async function hRead(args) {
   if (args.range) { const p = args.range.split("-").map(Number); r = ls.slice(Math.max(0,p[0]-1),p[1]||ls.length).join("\n"); }
   else if (args.head) { r = ls.slice(0,Math.max(0,args.head)).join("\n"); }
   else if (args.tail) { r = ls.slice(-Math.max(0,args.tail)).join("\n"); }
-  return { file: stripWS(fp), size: st.size, lines: ls.length, content: r };
+  const hash = crypto.createHash("sha256").update(c).digest("hex");
+  return { file: stripWS(fp), size: st.size, lines: ls.length, content: r, sha256: hash, sha256_short: hash.slice(0,12) };
 }
 
 async function hSearch(args) {
@@ -551,7 +619,22 @@ async function hEdit(args) {
   if (!existsSync(fp)) return {error:"Not found: "+stripWS(fp)};
   const cur = await readFile(fp,"utf8"); const cnt = cur.split(sr).length-1;
   if (cnt===0) return {error:"Text not found."}; if (cnt>1) return {error:"Text appears "+cnt+" times."};
-  await writeFile(fp,cur.replace(sr,rp),"utf8"); return {success:true,path:stripWS(fp)};
+    // expected_hash 检查
+  // 已存在文件默认要求 expected_hash
+  if (!args.expected_hash && !args.force) {
+    const curHash = crypto.createHash("sha256").update(cur).digest("hex");
+    return {error:"Hash required: file exists, pass expected_hash (sha256:"+curHash.slice(0,12)+") or force:true to overwrite.", file_hash: curHash.slice(0,12)};
+  }
+  if (args.expected_hash) {
+    const curHash = crypto.createHash("sha256").update(cur).digest("hex");
+    if (curHash !== args.expected_hash) return {error:"Hash mismatch: expected "+args.expected_hash.slice(0,12)+", got "+curHash.slice(0,12)+". File changed since last read."};
+  }
+  const oldHash = crypto.createHash("sha256").update(cur).digest("hex");
+  const newContent = cur.replace(sr, rp);
+  const newHash = crypto.createHash("sha256").update(newContent).digest("hex");
+  await writeFile(fp, newContent, "utf8");
+  if (args.force) audit("force_write", {tool:"edit_file",path:stripWS(fp),mode:MODE_NAME,old_hash:oldHash.slice(0,12),new_hash:newHash.slice(0,12)});
+  return {success:true,path:stripWS(fp),old_hash:oldHash.slice(0,12),new_hash:newHash.slice(0,12),changes:sr.length+"->"+rp.length};
 }
 
 async function hWrite(args) {
@@ -560,7 +643,25 @@ async function hWrite(args) {
   const p = dirname(fp); if (!existsSync(p)) await mkdir(p,{recursive:true});
   try { if (relative(WORKSPACE_ROOT,realpathSync(fp)).startsWith("..")) return {error:"Escaped after mkdir."}; }
   catch(e4) { if (e4.code==="ENOENT") { if (relative(WORKSPACE_ROOT,realpathSync(p)).startsWith("..")) return {error:"Parent escaped."}; } else throw e4; }
-  await writeFile(fp,c,"utf8"); return {success:true,path:stripWS(fp),bytes:c.length};
+  // expected_hash 检查（文件已存在时，默认要求）
+  if (existsSync(fp)) {
+    if (!args.expected_hash && !args.force) {
+      const cur = await readFile(fp, "utf8");
+      const curHash = crypto.createHash("sha256").update(cur).digest("hex");
+      return {error:"Hash required: file exists, pass expected_hash (sha256:"+curHash.slice(0,12)+") or force:true to overwrite.", file_hash: curHash.slice(0,12)};
+    }
+    if (args.expected_hash) {
+      const cur = await readFile(fp, "utf8");
+      const curHash = crypto.createHash("sha256").update(cur).digest("hex");
+      if (curHash !== args.expected_hash) return {error:"Hash mismatch: expected "+args.expected_hash.slice(0,12)+", got "+curHash.slice(0,12)};
+    }
+  }
+  var oldH = "";
+  if (args.force) { try { oldH = crypto.createHash("sha256").update(await readFile(fp, "utf8")).digest("hex").slice(0, 12); } catch(_) {} }
+  await writeFile(fp,c,"utf8");
+  const newHash = crypto.createHash("sha256").update(c).digest("hex");
+  if (args.force) audit("force_write", {tool:"write_file",path:stripWS(fp),mode:MODE_NAME,old_hash:oldH,new_hash:newHash.slice(0,12)});
+  return {success:true,path:stripWS(fp),bytes:c.length,hash:newHash.slice(0,12)};
 }
 
 // =========================================================================
@@ -586,8 +687,8 @@ var TOOLS = [
   {type:"function",function:{name:"run_command",description:"Run command. Mode: "+MODE_NAME+". WARNING: subprocess bypasses sandbox.",parameters:{type:"object",properties:{tool:ss("Tool: "+allCmds().join(", ")),args:sa("Args array"),cwd:ss("Subdir")},required:["tool","args"]}}},
   {type:"function",function:{name:"glob",description:"Find files by glob. No '..'. Sandboxed.",parameters:{type:"object",properties:{pattern:ss("Glob"),path:ss("Dir"),limit:nn("Max")},required:["pattern"]}}},
   {type:"function",function:{name:"get_file_info",description:"Get file/dir metadata.",parameters:{type:"object",properties:{path:ss("Path")},required:["path"]}}},
-  {type:"function",function:{name:"edit_file",description:"SEARCH/REPLACE edit. Needs mode=full.",parameters:{type:"object",properties:{path:ss("File"),search:ss("Text"),replace:ss("Repl")},required:["path","search","replace"]}}},
-  {type:"function",function:{name:"write_file",description:"Create/overwrite file. Needs mode=full.",parameters:{type:"object",properties:{path:ss("Path"),content:ss("Content")},required:["path","content"]}}},
+  {type:"function",function:{name:"edit_file",description:"SEARCH/REPLACE edit. Needs mode=full. 已存在文件默认要求 expected_hash，可用 force:true 跳过。",parameters:{type:"object",properties:{path:ss("File"),search:ss("Text"),replace:ss("Repl"),expected_hash:ss("SHA256 hash. 已存在文件默认要求，除非 force:true。"),force:bb("跳过 hash 检查直接覆盖，仅在 full 模式下可用。")},required:["path","search","replace"]}}},
+  {type:"function",function:{name:"write_file",description:"Create/overwrite file. Needs mode=full. 已存在文件默认要求 expected_hash，可用 force:true 跳过。",parameters:{type:"object",properties:{path:ss("Path"),content:ss("Content"),expected_hash:ss("SHA256 hash. 已存在文件默认要求，除非 force:true。"),force:bb("跳过 hash 检查直接覆盖，仅在 full 模式下可用。")},required:["path","content"]}}},
 ];
 
 // =========================================================================
@@ -643,6 +744,7 @@ function toolCallLabel(tc) {
 
 // 非流式调用 DeepSeek（规划阶段使用，不开放工具）
 async function callDeepSeekText(systemPrompt, userMsg, budget) {
+  const callBudget = Math.min(budget || CALL_MAX_TOKENS, CALL_MAX_TOKENS);
   const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) throw new Error("DEEPSEEK_API_KEY not set.");
   const res = await fetchR(DEEPSEEK_API_URL, {
@@ -651,7 +753,7 @@ async function callDeepSeekText(systemPrompt, userMsg, budget) {
     body: JSON.stringify({
       model: DEFAULT_MODEL, temperature: 0.2,
       messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userMsg }],
-      max_tokens: Math.min(budget || 10000, 16000),
+      max_tokens: Math.min(budget || CALL_MAX_TOKENS, CALL_MAX_TOKENS),
     }),
   });
   if (!res.ok) { const t = await res.text(); throw new Error("Plan API: " + res.status + " " + t.slice(0, 200)); }
@@ -665,15 +767,15 @@ async function executeOneStep(taskMsg, step, budget) {
   var msgs = [{ role: "system", content: sysPrompt }, { role: "user", content: taskMsg }];
   var log = [];
 
-  for (var turn = 0; turn < 15; turn++) {
-    console.error("[step " + step.id + "] turn " + (turn + 1) + "/15");
+  for (var turn = 0; turn < AGENT_MAX_TURNS; turn++) {
+    console.error("[step " + step.id + "] turn " + (turn + 1) + "/" + AGENT_MAX_TURNS);
     const response = await fetchR(DEEPSEEK_API_URL, {
       method: "POST",
       headers: { Authorization: "Bearer " + process.env.DEEPSEEK_API_KEY, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: DEFAULT_MODEL, temperature: 0.2,
         messages: msgs, tools: TOOLS, tool_choice: "auto",
-        stream: true, stream_options: { include_usage: true },
+        stream: true, max_tokens: Math.min(budget || CALL_MAX_TOKENS, CALL_MAX_TOKENS), stream_options: { include_usage: true },
       }),
     });
     if (!response.ok) { const st = response.status; const b = await response.text(); if (st === 401 || st === 403) throw new Error("Auth failed."); if (st === 429) throw new Error("Rate limited."); throw new Error("API error: " + st + " " + b.slice(0,100)); }
@@ -705,7 +807,7 @@ async function executeOneStep(taskMsg, step, budget) {
       msgs.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(result) });
     }
   }
-  log.push("[max turns]"); return { ok: true, content: "", log: log, turns: 15 };
+  log.push("[max turns]"); return { ok: true, content: "", log: log, turns: AGENT_MAX_TURNS };
 }
 
 // 主入口
@@ -720,14 +822,24 @@ async function executeTask(task, context) {
   console.error("[plan] generating plan...");
   var planRaw;
   try { planRaw = await callDeepSeekText(PLANNING_PROMPT, taskMsg, 8000); planRaw = planRaw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim(); }
-  catch (e) { console.error("[plan] failed: " + e.message + " — falling back"); planRaw = ""; }
+  catch (e) { console.error("[plan] failed: " + e.message); planRaw = ""; }
 
   var plan;
   try { plan = JSON.parse(planRaw); if (!Array.isArray(plan) || plan.length < 1) throw new Error("not array"); }
-  catch (e) { console.error("[plan] parse failed, using single-pass"); return { type: "text", text: "[plan phase failed — executing task directly]\n\n" + (await executeLegacy(taskMsg)).text }; }
+  catch (e) { console.error("[plan] parse failed"); return { type: "text", text: "## ⚠️ Plan 解析失败\n\nDeepSeek 返回的计划无法解析。不会自动降级执行，请重试或手动处理。\n\n原始返回:\n" + planRaw.slice(0, 500) }; }
 
-  console.error("[plan] " + plan.length + " steps");
-  for (const s of plan) console.error("  " + s.id + ". " + s.file + " — " + s.action);
+  // 规范化字段（兼容旧格式）
+  normalizePlan(plan);
+
+  // 校验计划
+  const planErr = validatePlan(plan);
+  if (planErr) {
+    console.error("[plan] validation failed: " + planErr);
+    return { type: "text", text: "## ⚠️ Plan 校验失败\n\n错误: " + planErr + "\n\n计划不安全，不会自动降级执行。\n请修改需求后重新规划，或手动执行具体步骤。" };
+  }
+
+  console.error("[plan] " + plan.length + " steps (validated)");
+  for (const s of plan) console.error("  " + s.id + ". " + (s.write_files||[]).join(", ") + " — " + (s.action||""));
 
   // ════════════════════════════════════════════
   // Phase 2: 逐步骤执行
@@ -735,8 +847,9 @@ async function executeTask(task, context) {
   const budgetPerStep = Math.max(10000, Math.floor(MAX_TOTAL_TOKENS / plan.length));
 
   for (const step of plan) {
-    console.error("\n══════════ Step " + step.id + "/" + plan.length + ": " + step.file + " ══════════");
-    var stepMsg = "## 任务\n" + task + "\n\n## 当前步骤\n- 文件: " + step.file + "\n- 做什么: " + step.action + "\n\n";
+    const targetFiles = (step.write_files || []).join(", ");
+    console.error("\n══════════ Step " + step.id + "/" + plan.length + ": " + targetFiles + " ══════════");
+    var stepMsg = "## 任务\n" + task + "\n\n## 当前步骤\n- 文件: " + targetFiles + "\n- 做什么: " + step.action + "\n\n";
     if (timeline.length > 0) {
       stepMsg += "## 已完成的前置步骤\n";
       for (const t of timeline) stepMsg += "- " + t.file + " (" + t.action + ") — " + (t.ok ? "✅" : "⚠️") + "\n";
@@ -755,125 +868,6 @@ async function executeTask(task, context) {
   for (const t of timeline) report += "| " + t.id + " | `" + t.file + "` | " + (t.ok ? "✅" : "❌") + " |\n";
   report += "\n**总计**: " + timeline.length + "/" + plan.length + " 步骤 · " + timeline.reduce((s, t) => s + t.turns, 0) + " 轮次 · 预算 " + Math.round(MAX_TOTAL_TOKENS/1000) + "k tokens\n";
   return { type: "text", text: report };
-}
-
-// 原始单循环执行（规划失败时的降级方案）
-async function executeLegacy(taskMsg) {
-  if (!process.env.DEEPSEEK_API_KEY) throw new Error("DEEPSEEK_API_KEY not set.");
-  const sysPrompt = await loadPrompt();
-  var messages = [{ role: "system", content: sysPrompt }, { role: "user", content: taskMsg }];
-  var toolCallLog = [];
-
-  for (var turn = 0; turn < MAX_TOOL_TURNS; turn++) {
-    console.error("[bridge] turn " + (turn + 1) + "/" + MAX_TOOL_TURNS);
-
-    const response = await fetchR(DEEPSEEK_API_URL, {
-      method: "POST",
-      headers: { Authorization: "Bearer " + apiKey, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: DEFAULT_MODEL,
-        temperature: Number.isFinite(DEFAULT_TEMPERATURE) ? DEFAULT_TEMPERATURE : 0.2,
-        messages: messages,
-        tools: TOOLS,
-        tool_choice: "auto",
-        stream: true,
-        stream_options: { include_usage: true },
-      }),
-    });
-
-    if (!response.ok) {
-      const st = response.status;
-      const body = await response.text();
-      if (st === 401 || st === 403) throw new Error("Auth failed.");
-      if (st === 429) throw new Error("Rate limited.");
-      if (st >= 500) throw new Error("Server error.");
-      throw new Error("API error: " + st);
-    }
-
-    // ---- SSE stream reader ----
-    const reader = response.body.getReader();
-    var decoder = new TextDecoder();
-    var buffer = "";
-    var content = "";
-    var tcAccum = {};
-    var doneSeen = false;
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done || doneSeen) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        const parsed = parseSSE(line);
-        if (!parsed) continue;
-        if (parsed._done) { doneSeen = true; break; }
-        if (parsed.usage) {
-          usage = parsed.usage;
-        }
-
-        const delta = parsed.choices && parsed.choices[0] && parsed.choices[0].delta;
-        if (!delta) continue;
-        if (delta.content) content += delta.content;
-        if (delta.tool_calls) accTC(tcAccum, delta);
-      }
-    }
-
-    // Flush buffer
-    if (buffer.trim()) {
-      const parsed = parseSSE(buffer.trim());
-      if (parsed && !parsed._done && parsed.choices && parsed.choices[0] && parsed.choices[0].delta) {
-        const d = parsed.choices[0].delta;
-        if (d.content) content += d.content;
-        if (d.tool_calls) accTC(tcAccum, d);
-        if (parsed.usage) usage = parsed.usage;
-      }
-    }
-
-    const toolCalls = deltasToTC(tcAccum);
-
-    // Budget check: if cumulative tokens exceed limit, stop gracefully
-    if (usage) {
-      totalTokensIn += usage.prompt_tokens || 0;
-      totalTokensOut += usage.completion_tokens || 0;
-      const spent = totalTokensIn + totalTokensOut;
-      if (spent > MAX_TOTAL_TOKENS) {
-        var limitReport = content ? content.slice(0, 500) + "\n\n[budget: " + spent + " tokens exceeded " + MAX_TOTAL_TOKENS + "]" : "Budget exceeded.";
-        limitReport += "\n\n---\n";
-        if (toolCallLog.length) limitReport += "Actions: " + toolCallLog.join("; ") + "\n";
-        limitReport += "Tokens: " + JSON.stringify({ prompt: totalTokensIn, completion: totalTokensOut, total: spent }) + "\n";
-        limitReport += "Turns: " + (turn + 1) + " (budget stop)\n";
-        return { type: "text", text: limitReport };
-      }
-    }
-
-    if (!toolCalls.length) {
-      // No tool calls -- task complete
-      var report = content || "Task completed.";
-      report += "\n\n---\n";
-      if (toolCallLog.length) report += "Actions: " + toolCallLog.join("; ") + "\n";
-      report += "Tokens: " + JSON.stringify({ prompt: totalTokensIn, completion: totalTokensOut, total: totalTokensIn + totalTokensOut }) + "\n";
-      report += "Turns: " + (turn + 1) + "\n";
-      console.error("[bridge] done in " + (turn + 1) + " turns");
-      return { type: "text", text: report };
-    }
-
-    // Push assistant message
-    messages.push({ role: "assistant", content: content || null, tool_calls: toolCalls });
-
-    // Execute each tool call
-    for (const tc of toolCalls) {
-      const label = toolCallLabel(tc);
-      console.error("[bridge] call: " + label);
-      toolCallLog.push(label);
-      const result = await execTC(tc);
-      messages.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(result) });
-    }
-  }
-
-  throw new Error("Exceeded max turns (" + MAX_TOOL_TURNS + ").");
 }
 
 // =========================================================================
@@ -925,8 +919,10 @@ server.setRequestHandler(ListToolsRequestSchema, async function () {
       },
       {
         name: "execute_task",
-        description: "[推荐] 统一执行入口。自动判断任务复杂度：简单任务用单智能体，" +
-          "复杂任务自动拆解为多智能体并行执行。你只需要描述需求，不用关心用哪个模式。" +
+        description: "[受控执行入口] Bridge 总控，DeepSeek 执行。" +
+          "所有写入受计划、write-set、hash、diff 约束。" +
+          "简单任务单 agent，复杂任务多 agent 分工。" +
+          "DeepSeek 连续 5 次改不好 → improve_file 熔断 → Codex 接手。" +
           "Mode: " + MODE_NAME + ". Budget: " + Math.round(MAX_TOTAL_TOKENS/1000) + "k tokens.",
         inputSchema: {
           type: "object",
@@ -953,15 +949,16 @@ server.setRequestHandler(ListToolsRequestSchema, async function () {
       },
       {
         name: "improve_file",
-        description: "委托 DeepSeek 修改代码。Codex 只需要描述想改什么（目标/想法），" +
-          "DeepSeek 会读取文件并完成修改。不要自己直接改代码——" +
-          "有任何修改意见都通过这个工具交给 DeepSeek 处理。Mode: " + MODE_NAME + ".",
+        description: "委托 DeepSeek 修改代码。首次用 attempt=1，每多改一次 +1。" +
+          "到达 5 次后工具会返回 ⚠️ 熔断信号，Codex 直接接手。" +
+          "下一个新任务重新从 attempt=1 开始。Mode: " + MODE_NAME + ".",
         inputSchema: {
           type: "object",
           properties: {
             file:    ss("Path to the file to improve."),
             idea:    ss("What to improve or change. Describe the goal, not the implementation."),
             context: ss("Optional: additional context, constraints, or examples."),
+            attempt: nn("(可选) 当前尝试次数，从 1 开始。默认 1，最大 5。到 5 后熔断。"),
           },
           required: ["file", "idea"],
           additionalProperties: false,
@@ -988,23 +985,27 @@ server.setRequestHandler(ListToolsRequestSchema, async function () {
 
 server.setRequestHandler(CallToolRequestSchema, async function (req) {
   const a = req.params.arguments || {};
-  const task = reqS(a.task, "task");
 
   switch (req.params.name) {
     case "plan_task": {
+      const task = reqS(a.task, "task");
       const ctx = optS(a.context);
       console.error("[plan] planning: " + task.slice(0, 80) + "...");
       try {
         const planText = await callDeepSeekText(PLANNING_PROMPT, buildMsg(task, ctx), 8000);
         const clean = planText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-        JSON.parse(clean); // validate
-        return { content: [{ type: "text", text: clean }] };
+        const parsed = JSON.parse(clean);
+        normalizePlan(parsed);
+        const validationError = validatePlan(parsed);
+        if (validationError) return { content: [{ type: "text", text: "Plan 校验失败: " + validationError + "\n请重新生成计划，确保 write_files 不冲突。" }], isError: true };
+        return { content: [{ type: "text", text: JSON.stringify(parsed, null, 2) }] };
       } catch (e) {
         return { content: [{ type: "text", text: "Planning failed: " + e.message }], isError: true };
       }
     }
 
     case "execute_step": {
+      const task = reqS(a.task, "task");
       const stepId = reqS(a.step_id, "step_id");
       const file = reqS(a.file, "file");
       const action = reqS(a.action, "action");
@@ -1033,7 +1034,7 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
     }
 
     case "execute_task": {
-      // 统一入口：自动判断复杂度，选择合适的执行模式
+      const task = reqS(a.task, "task");
       const execCtx = optS(a.context) || "";
       console.error("[exec] auto-detect: " + task.slice(0, 80) + "...");
 
@@ -1075,6 +1076,7 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
     }
 
     case "orchestrate_task": {
+      const task = reqS(a.task, "task");
       const ctx = optS(a.context) || "";
       return await handleOrchestrate(task, ctx);
     }
@@ -1100,19 +1102,23 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
 
       if (subTasks.length > 12) subTasks = subTasks.slice(0, 12);
 
-      // 深度拆解
+      // ═══ 第一次规范化（JSON parse 后立即执行）═══
+      normalizePlan(subTasks);
+
+      // 深度拆解（写在规范化之后，用 write_files）
       var allSubTasks = [];
       for (var si = 0; si < subTasks.length; si++) {
         const st = subTasks[si];
-        if ((st.files || []).length > 3) {
+        if ((st.write_files || []).length > 3) {
           console.error("[progress] 🔄 " + (SCIENTIST[st.role] || "") + " 再拆...");
           try {
-            var sp = await callDeepSeekText(ORCHESTRATOR_PROMPT, "作为" + (SCIENTIST[st.role] || "") + ":" + st.action + "\n文件:" + (st.files||[]).join(", "), 5000);
+            var sp = await callDeepSeekText(ORCHESTRATOR_PROMPT, "作为" + (SCIENTIST[st.role] || "") + ":" + st.action + "\n文件:" + (st.write_files||[]).join(", "), 5000);
             var st2 = JSON.parse(sp.replace(/^```(?:json)?\s*/i,"").replace(/\s*```$/i,"").trim());
+            normalizePlan(st2);
             if (Array.isArray(st2) && st2.length > 0) {
               var room = 12 - allSubTasks.length - (subTasks.length - si - 1);
               for (var j = 0; j < Math.min(st2.length, room, 4); j++) {
-                allSubTasks.push({ role: st.role, action: st2[j].action||"", files: st2[j].files||[], depends_on: [], parentRole: st.role, suffix: String.fromCharCode(65+j), label: (SCIENTIST[st.role]||"") + "-" + String.fromCharCode(65+j) });
+                allSubTasks.push({ role: st.role, action: st2[j].action||"", write_files: st2[j].write_files||[], depends_on: [], parentRole: st.role, suffix: String.fromCharCode(65+j), label: (SCIENTIST[st.role]||"") + "-" + String.fromCharCode(65+j) });
               }
               continue;
             }
@@ -1121,6 +1127,7 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
         allSubTasks.push({ ...st, parentRole: null, suffix: "", label: SCIENTIST[st.role] || "" });
       }
       subTasks = allSubTasks;
+      normalizePlan(subTasks); // 二次规范化
 
       // 报告表头
       var done = 0, failed = 0;
@@ -1128,13 +1135,34 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
       for (var i = 0; i < subTasks.length; i++) report += (i+1) + ". " + subTasks[i].label + " → " + (subTasks[i].action||"").slice(0,60) + "\n";
       report += "\n### 📊 执行\n\n| 科学家 | 状态 | 文件 | 轮次 | 耗时 |\n|:------:|:----:|:----:|:----:|:----:|\n";
 
-      // 增量模式检测
+      // 增量模式检测（规范化之后，用 write_files）
       console.error("[progress] 🔍 增量检测...");
       var existingFiles = [];
-      for (const st of subTasks) for (const f of (st.files||[])) { try { if (existsSync(sandboxPath(f))) existingFiles.push(f); } catch (_) {} }
+      for (const st of subTasks) for (const f of (st.write_files||[])) { try { if (existsSync(sandboxPath(f))) existingFiles.push(f); } catch (_) {} }
       if (existingFiles.length > 0) console.error("[progress] 📁 " + existingFiles.length + " 个已存在");
 
+      // 文件冲突检测：同批次并行写同一个文件的子任务改为串行
+      var fileOwnership = {};
+      for (var fi = 0; fi < subTasks.length; fi++) {
+        for (var ff of (subTasks[fi].write_files || [])) {
+          if (fileOwnership[ff] !== undefined) {
+            const prev = fileOwnership[ff];
+            // 后一个依赖前一个（串行化）
+            if (!subTasks[fi].depends_on) subTasks[fi].depends_on = [];
+            if (!subTasks[fi].depends_on.includes(prev)) subTasks[fi].depends_on.push(prev);
+            console.error("[progress] 🔒 文件冲突: " + ff + " → " + subTasks[prev].label + " 先写, " + subTasks[fi].label + " 后写");
+          } else {
+            fileOwnership[ff] = fi;
+          }
+        }
+      }
+
       // 执行循环（含动态预算 + 智能体通信）
+      // 统一字段：files → write_files（兼容老格式）
+      for (var uf = 0; uf < subTasks.length; uf++) {
+        if (subTasks[uf].files && !subTasks[uf].write_files) subTasks[uf].write_files = subTasks[uf].files;
+      }
+
       var pending = subTasks.map((st,idx) => ({...st, idx}));
       var completed = [], allResults = {}, usedBudget = 0, agentContracts = [], agentStarts = {};
 
@@ -1144,7 +1172,7 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
 
         // 动态预算
         var surplus = Math.max(0, MAX_TOTAL_TOKENS - usedBudget - (pending.length - ready.length) * 50000);
-        var batchBudget = Math.max(30000, Math.floor(Math.min(surplus / ready.length, MAX_TOTAL_TOKENS / subTasks.length * 1.5)));
+        var batchBudget = Math.max(50000, Math.floor(Math.min(surplus / ready.length, MAX_TOTAL_TOKENS / subTasks.length * 1.5)));
 
         console.error("[progress] ▶️ " + ready.length + "/" + subTasks.length + " · " + Math.round(batchBudget/1000) + "k/个");
         for (const r of ready) { agentStarts[r.idx] = Date.now(); console.error("[progress]   ├─ " + r.label + " 开始..."); }
@@ -1164,8 +1192,9 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
 
           const sp = await loadPrompt();
           var msgs = [{role:"system",content:sp},{role:"user",content:p}], log = [];
-          for (var t = 0; t < 10; t++) {
-            const r2 = await fetchR(DEEPSEEK_API_URL, {method:"POST", headers:{Authorization:"Bearer "+process.env.DEEPSEEK_API_KEY,"Content-Type":"application/json"}, body:JSON.stringify({model:DEFAULT_MODEL,temperature:0.2,messages:msgs,tools:TOOLS,tool_choice:"auto",stream:true,stream_options:{include_usage:true}})});
+          for (var t = 0; t < AGENT_MAX_TURNS; t++) {
+            const r2 = await fetchR(DEEPSEEK_API_URL, {method:"POST", headers:{Authorization:"Bearer "+process.env.DEEPSEEK_API_KEY,"Content-Type":"application/json"}, body:JSON.stringify({model:DEFAULT_MODEL,temperature:0.2,messages:msgs,tools:TOOLS,tool_choice:"auto",stream:true,max_tokens:Math.min(batchBudget, CALL_MAX_TOKENS),stream_options:{include_usage:true}})});
+            if (!r2.ok) { const errT = await r2.text(); console.error('[agent] DeepSeek ' + r2.status + ': ' + errT.slice(0,100)); return {ok:false,agent:scientist,idx:st.idx,files:st.files||[],contract:'',log:[]}; }
             const reader = r2.body.getReader(); var dec = new TextDecoder(), buf = "", con = "", tcA = {}, ds = false;
             while (true) { const {done,value} = await reader.read(); if(done||ds) break; buf += dec.decode(value,{stream:true}); const ls = buf.split("\n"); buf = ls.pop()||""; for(const l of ls) { const p2 = parseSSE(l); if(!p2) continue; if(p2._done){ds=true;break} const d=p2.choices?.[0]?.delta; if(!d) continue; if(d.content) con+=d.content; if(d.tool_calls) accTC(tcA,d); } }
             const tcs = deltasToTC(tcA);
@@ -1196,14 +1225,25 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
       const file = reqS(a.file, "file");
       const idea = reqS(a.idea, "idea");
       const ctx = optS(a.context) || "";
-      console.error("[improve] " + file + ": " + idea.slice(0, 80));
+      const attempt = typeof a.attempt === "number" ? a.attempt : 1;
+
+      // 熔断检查：超过 5 次 → 让 Codex 接手（第 5 次仍允许尝试）
+      if (attempt > 5) {
+        console.error("[improve] ⚠️ 已达最大尝试次数(" + attempt + ")，熔断");
+        return {
+          content: [{ type: "text", text: "⚠️ 已达最大尝试次数(5)，DeepSeek 无法满足要求。请 Codex 直接修改此文件。" }],
+          isError: true
+        };
+      }
+
+      console.error("[improve] attempt " + attempt + "/5: " + file + ": " + idea.slice(0, 80));
 
       try {
         // 读取当前文件内容
         var fileContent = "(file does not exist yet)";
         try {
           const fp = sandboxPath(file);
-          fileContent = await readFile(fp, "utf8").slice(0, MAX_FILE_SIZE);
+          fileContent = (await readFile(fp, "utf8")).slice(0, MAX_FILE_SIZE);
         } catch (_) {}
 
         // CodeX 提目标/想法，DeepSeek 负责实现
@@ -1277,7 +1317,7 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
           const toolCalls = deltasToTC(tcAccum);
           if (!toolCalls.length) {
             console.error("[fix] done in " + (turn + 1) + " turns");
-            return { content: [{ type: "text", text: "## 修复完成\n\n文件: `" + file + "`\n问题: " + issue + "\n操作: " + log.join("; ") + "\n\n" + (content || "").slice(0, 500) }] };
+            return { content: [{ type: "text", text: "## 修复完成\n\n文件: `" + file + "`\n改进: " + idea + "\n操作: " + log.join("; ") + "\n\n" + (content || "").slice(0, 500) }] };
           }
 
           msgs.push({ role: "assistant", content: content || null, tool_calls: toolCalls });
@@ -1296,8 +1336,9 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
     }
 
     case "delegate_to_reasonix": {
+      const task = reqS(a.task, "task");
       const ctx = optS(a.context);
-      console.error("[bridge] legacy task: " + task.slice(0, 80) + "...");
+      console.error("[bridge] compatibility task: " + task.slice(0, 80) + "...");
       try { return { content: [await executeTask(task, ctx)] }; }
       catch (e) { return { content: [{ type: "text", text: "Failed: " + e.message }], isError: true }; }
     }
@@ -1314,7 +1355,7 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
 await server.connect(new StdioServerTransport());
 console.error("");
 console.error("====================================================================");
-console.error("  mcp-bridge-reasonix v0.16.0  [2-phase execution + plan/execute/summary]");
+console.error("  Reasonix Bridge  [MCP 编码代理 - 受控执行]");
 console.error("  workspace: " + WORKSPACE_ROOT + "  mode: " + MODE_NAME + " (lvl:" + modeLevel + ")");
 console.error("  cmds:" + allowCommands + " write:" + allowWrite + " verify:" + allowVerify);
 console.error("");
@@ -1323,6 +1364,6 @@ console.error("  static  : no package scripts -- static tools only");
 console.error("  verify  : static + npm test, eslint, jest (runs project scripts)");
 console.error("  full    : allowlisted cmds unrestricted, writes enabled");
 console.error("  git     : available in static+ (not in readonly)");
-console.error("  budget  : " + Math.round(MAX_TOTAL_TOKENS/1000) + "k tokens  |  plan: auto");
+console.error("  budget  : " + Math.round(MAX_TOTAL_TOKENS/1000) + "k tokens  |  turns: " + AGENT_MAX_TURNS + "  |  plan: auto");
 console.error("====================================================================");
 console.error("");
