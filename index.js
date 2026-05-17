@@ -691,6 +691,16 @@ var TOOLS = [
   {type:"function",function:{name:"write_file",description:"Create/overwrite file. Needs mode=full. 已存在文件默认要求 expected_hash，可用 force:true 跳过。",parameters:{type:"object",properties:{path:ss("Path"),content:ss("Content"),expected_hash:ss("SHA256 hash. 已存在文件默认要求，除非 force:true。"),force:bb("跳过 hash 检查直接覆盖，仅在 full 模式下可用。")},required:["path","content"]}}},
 ];
 
+function wantsReadOnlyTask(text) {
+  const s = String(text || "").toLowerCase();
+  return /只读|只审查|只分析|不要修改|不要改动|不要写入|不要创建|不要直接修改|不修改任何文件|不改文件|no modification|do not modify|do not write|read.?only|review only/.test(s);
+}
+
+function toolsForTask(text) {
+  if (!wantsReadOnlyTask(text)) return TOOLS;
+  return TOOLS.filter(t => !["edit_file", "write_file"].includes(t.function.name));
+}
+
 // =========================================================================
 //  STREAMING AGENT LOOP
 // =========================================================================
@@ -762,7 +772,8 @@ async function callDeepSeekText(systemPrompt, userMsg, budget) {
 }
 
 // 单步执行（独立上下文、独立预算）
-async function executeOneStep(taskMsg, step, budget) {
+async function executeOneStep(taskMsg, step, budget, availableTools) {
+  const stepTools = availableTools || TOOLS;
   const sysPrompt = await loadPrompt();
   var msgs = [{ role: "system", content: sysPrompt }, { role: "user", content: taskMsg }];
   var log = [];
@@ -774,7 +785,7 @@ async function executeOneStep(taskMsg, step, budget) {
       headers: { Authorization: "Bearer " + process.env.DEEPSEEK_API_KEY, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: DEFAULT_MODEL, temperature: 0.2,
-        messages: msgs, tools: TOOLS, tool_choice: "auto",
+        messages: msgs, tools: stepTools, tool_choice: "auto",
         stream: true, max_tokens: Math.min(budget || CALL_MAX_TOKENS, CALL_MAX_TOKENS), stream_options: { include_usage: true },
       }),
     });
@@ -798,7 +809,7 @@ async function executeOneStep(taskMsg, step, budget) {
     if (buffer.trim()) { const parsed = parseSSE(buffer.trim()); if (parsed && parsed.choices?.[0]?.delta) { const d = parsed.choices[0].delta; if (d.content) content += d.content; if (d.tool_calls) accTC(tcAccum, d); } }
 
     const toolCalls = deltasToTC(tcAccum);
-    if (!toolCalls.length) { log.push("[done]"); console.error("[step " + step.id + "] done in " + (turn + 1) + " turns"); return { ok: true, content: (content || "").slice(0, 300), log: log, turns: turn + 1 }; }
+    if (!toolCalls.length) { log.push("[done]"); console.error("[step " + step.id + "] done in " + (turn + 1) + " turns"); return { ok: true, content: (content || "").slice(0, 8000), log: log, turns: turn + 1 }; }
 
     msgs.push({ role: "assistant", content: content || null, tool_calls: toolCalls });
     for (const tc of toolCalls) {
@@ -1061,11 +1072,11 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
         // 简单任务 → 单智能体直行
         console.error("[exec] 单智能体模式");
         const stepMsg = "## 任务\n" + task + "\n\n请完成上述任务，创建或修改必要的文件，然后运行验证命令确认无误。\n";
-        const result = await executeOneStep(stepMsg, { id: 1, file: "项目", action: task }, MAX_TOTAL_TOKENS);
+        const result = await executeOneStep(stepMsg, { id: 1, file: "项目", action: task }, MAX_TOTAL_TOKENS, toolsForTask(task + "\n" + execCtx));
         return {
           content: [{
             type: "text",
-            text: "## ✅ 执行完成\n\n- 模式：单智能体\n- 轮次：" + result.turns + "\n- 摘要：" + (result.content || "").slice(0, 500) + "\n"
+            text: "## ✅ 执行完成\n\n- 模式：单智能体\n- 轮次：" + result.turns + "\n\n## 结果\n\n" + (result.content || "").slice(0, 8000) + "\n"
           }]
         };
       } else {
@@ -1086,7 +1097,10 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
     // ═══════════════════════════════════════════════════════════════
     async function handleOrchestrate(task, ctx) {
       const startTime = Date.now();
+      const agentTools = toolsForTask(task + "\n" + ctx);
+      const readOnly = agentTools.length !== TOOLS.length;
       console.error("[progress] 🚀 开始:" + task.slice(0, 60) + "...");
+      if (readOnly) console.error("[progress] 🔒 只读任务: 已禁用 edit_file/write_file");
 
       // ── Step 1：拆解 + 进度 ──
       console.error("[progress] 📋 拆解任务...");
@@ -1188,20 +1202,21 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
           }
           if (agentContracts.length > 0) { p += "\n## 已完成成员接口\n"; for (const c of agentContracts) p += "- " + c.agent + ": " + c.summary + "\n"; p += "请对接。\n"; }
           if (existingFiles.length > 0) p += "\n## 增量模式\n以下文件已存在，请先 read_file 再编辑，不要盲目覆盖：" + existingFiles.join(", ") + "\n";
-          p += "\n完成后验证。";
+          if (readOnly) p += "\n## 只读约束\n用户明确要求不要修改文件。你不能写入、创建或编辑任何文件；所有结论必须直接写在最终回复中。\n";
+          p += "\n完成后验证。最后必须输出可交给 Codex 的结论，包含：完成内容、发现的问题、验证结果、风险、建议。不要只输出过程。";
 
           const sp = await loadPrompt();
           var msgs = [{role:"system",content:sp},{role:"user",content:p}], log = [];
           for (var t = 0; t < AGENT_MAX_TURNS; t++) {
-            const r2 = await fetchR(DEEPSEEK_API_URL, {method:"POST", headers:{Authorization:"Bearer "+process.env.DEEPSEEK_API_KEY,"Content-Type":"application/json"}, body:JSON.stringify({model:DEFAULT_MODEL,temperature:0.2,messages:msgs,tools:TOOLS,tool_choice:"auto",stream:true,max_tokens:Math.min(batchBudget, CALL_MAX_TOKENS),stream_options:{include_usage:true}})});
-            if (!r2.ok) { const errT = await r2.text(); console.error('[agent] DeepSeek ' + r2.status + ': ' + errT.slice(0,100)); return {ok:false,agent:scientist,idx:st.idx,files:st.files||[],contract:'',log:[]}; }
+            const r2 = await fetchR(DEEPSEEK_API_URL, {method:"POST", headers:{Authorization:"Bearer "+process.env.DEEPSEEK_API_KEY,"Content-Type":"application/json"}, body:JSON.stringify({model:DEFAULT_MODEL,temperature:0.2,messages:msgs,tools:agentTools,tool_choice:"auto",stream:true,max_tokens:Math.min(batchBudget, CALL_MAX_TOKENS),stream_options:{include_usage:true}})});
+            if (!r2.ok) { const errT = await r2.text(); console.error('[agent] DeepSeek ' + r2.status + ': ' + errT.slice(0,100)); return {ok:false,agent:scientist,idx:st.idx,files:st.write_files||st.files||[],contract:'',result:'',log:[]}; }
             const reader = r2.body.getReader(); var dec = new TextDecoder(), buf = "", con = "", tcA = {}, ds = false;
             while (true) { const {done,value} = await reader.read(); if(done||ds) break; buf += dec.decode(value,{stream:true}); const ls = buf.split("\n"); buf = ls.pop()||""; for(const l of ls) { const p2 = parseSSE(l); if(!p2) continue; if(p2._done){ds=true;break} const d=p2.choices?.[0]?.delta; if(!d) continue; if(d.content) con+=d.content; if(d.tool_calls) accTC(tcA,d); } }
             const tcs = deltasToTC(tcA);
-            if (!tcs.length) { var contract = (con||"").slice(0,200); var el = Math.round((Date.now()-(agentStarts[st.idx]||Date.now()))/1000); console.error("[progress]   └─ " + scientist + " ✅ "+(t+1)+"轮 "+el+"s"); return {ok:true,agent:scientist,idx:st.idx,files:st.files||[],turns:t+1,contract:contract,log}; }
+            if (!tcs.length) { var resultText = (con||"").trim(); var contract = resultText.slice(0,1200); var el = Math.round((Date.now()-(agentStarts[st.idx]||Date.now()))/1000); console.error("[progress]   └─ " + scientist + " ✅ "+(t+1)+"轮 "+el+"s"); return {ok:true,agent:scientist,idx:st.idx,files:st.write_files||st.files||[],turns:t+1,contract:contract,result:resultText.slice(0,8000),log}; }
             msgs.push({role:"assistant",content:con||null,tool_calls:tcs}); for(const tc of tcs) { const lb = toolCallLabel(tc); log.push(lb); const r3 = await execTC(tc); msgs.push({role:"tool",tool_call_id:tc.id,content:JSON.stringify(r3)}); }
           }
-          console.error("[progress]   └─ " + scientist + " ⚠️ 超时"); return {ok:false,agent:scientist,idx:st.idx,files:st.files||[],contract:"",log:[]};
+          console.error("[progress]   └─ " + scientist + " ⚠️ 超时"); return {ok:false,agent:scientist,idx:st.idx,files:st.write_files||st.files||[],contract:"",result:"",log:[]};
         }));
 
         for (const r of res) {
@@ -1217,6 +1232,21 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
 
       var totalTime = Math.round((Date.now()-startTime)/1000);
       report += "\n**总计**: " + subTasks.length + " · " + done + "✅" + (failed>0?" "+failed+"⚠️":"") + " · " + totalTime + "s\n";
+      report += "\n### 🧾 子任务关键结论\n\n";
+      for (var ri = 0; ri < subTasks.length; ri++) {
+        const rr = allResults[ri];
+        const st = subTasks[ri];
+        if (!rr) {
+          report += "#### " + (ri + 1) + ". " + (st.label || "agent") + "\n\n未返回结果。\n\n";
+          continue;
+        }
+        report += "#### " + (ri + 1) + ". " + rr.agent + "\n\n";
+        report += "- 状态: " + (rr.ok ? "成功" : "失败或超时") + "\n";
+        if ((rr.files || []).length) report += "- 文件: " + (rr.files || []).join(", ") + "\n";
+        if ((rr.log || []).length) report += "- 操作: " + rr.log.join("; ") + "\n";
+        const body = (rr.result || rr.contract || "").trim();
+        report += "\n" + (body || "未返回可用结论。") + "\n\n";
+      }
       console.error("[progress] ✅ " + totalTime + "s");
       return { content: [{ type: "text", text: report }] };
     }
