@@ -74,6 +74,14 @@ Bridge 自动判断复杂度：
 - **简单任务**（1~2 文件） → 单智能体直行
 - **复杂任务**（多模块/多领域） → 多智能体并行
 
+### 推荐使用方式
+
+日常优先使用 `execute_task`。它会先判断任务复杂度，简单任务走单智能体，复杂任务自动拆分给多个子智能体。适合代码审查、跨文件搜索、局部修改、运行验证命令和多模块任务。
+
+只想看方案时使用 `plan_task`，确认计划后再用 `execute_step` 分步执行。明确需要多角色并行时使用 `orchestrate_task`。旧的 `delegate_to_reasonix` 仅用于兼容旧指令，新用法不建议继续依赖。
+
+只读审查任务建议在 prompt 中明确写出“只读 / 不要修改文件 / 不要写入文件”。Bridge 会自动移除 `edit_file` 和 `write_file`，但仍允许读取、搜索和运行验证命令。
+
 ---
 
 ## 🧪 科学家团队
@@ -140,11 +148,11 @@ Phase 2：逐步骤执行 / 多智能体并行（每步独立上下文）
 | 变量 | 默认值 | 说明 |
 |:-----|:------:|:-----|
 | `DEEPSEEK_API_KEY` | — | **必填** | DeepSeek API 密钥 |
-| `REASONIX_COMMAND_MODE` | `off` | 命令模式分级 |
+| `REASONIX_COMMAND_MODE` | `static` | 命令模式分级 |
 | `WORKSPACE_ROOT` | `cwd` | 沙箱根目录 |
 | `DEEPSEEK_MODEL` | `deepseek-chat` | 模型 |
 | `DEEPSEEK_TEMPERATURE` | `0.2` | 温度参数 |
-| `REASONIX_MAX_TOKENS` | `300000` | 累计 Token 预算 |
+| `REASONIX_MAX_TOKENS` | `64000` | 累计 Token 预算 |
 | `HTTP_PROXY` | — | 代理（仅国外 API） |
 | `GITHUB_TOKEN` | — | GitHub API 限速提升 |
 
@@ -158,6 +166,15 @@ Phase 2：逐步骤执行 / 多智能体并行（每步独立上下文）
 | `verify` | + npm test / eslint / jest |
 | `full` | 全开放 + 写文件 |
 
+### 安全模式建议
+
+| 场景 | 推荐模式 | 说明 |
+|:-----|:--------|:-----|
+| 只读审查、搜索、总结 | `static` | 默认推荐，可读文件，可运行安全验证类命令 |
+| 跑测试、lint、构建验证 | `verify` | 允许更多验证命令，适合 CI 前检查 |
+| 需要改文件 | `full` | 仅在明确需要写入时使用，写已有文件默认要求 `expected_hash` |
+| 高风险/不信任项目 | `off` 或 `readonly` | 尽量不开放命令执行 |
+
 ---
 
 ## 🛡️ 安全
@@ -166,12 +183,16 @@ Phase 2：逐步骤执行 / 多智能体并行（每步独立上下文）
 |:-----|:------|
 | **文件沙箱** | `sandboxPath()` 校验所有路径，拒绝越界/symlink逃逸 |
 | **命令分级** | 5 级授权，`full` 模式才允许写操作 |
+| **只读保护** | 任务明确要求只读时，自动禁用 `edit_file` / `write_file` |
+| **Hash 防覆盖** | 覆盖已有文件默认要求 `expected_hash`，避免并发或误覆盖 |
+| **强制写审计** | `force:true` 会记录工具、路径、模式、新旧 hash |
 | **预算控制** | `REASONIX_MAX_TOKENS` 硬上限，超限优雅停止 |
 | **Token 隔离** | `.gitignore` 已排除 `.env` 和 API Key 文件 |
 | **`improve_file`** | DeepSeek 定向修复工具；失败或不满足要求时 Codex 可直接接管 |
 
 > ⚠️ `run_command` 子进程不受 JS 沙箱约束，可读任意文件和环境变量。
 > ⚠️ `force:true` 跳过 hash 检查直接覆盖已存在文件，仅用户明确要求时使用，不建议模型自动触发。
+> ⚠️ `full` 模式适合受信任项目的开发阶段，不建议对不可信仓库长期启用。
 
 ---
 
@@ -203,4 +224,4 @@ MIT
 | 运行时依赖 | `@modelcontextprotocol/sdk` + `glob` |
 | Node 版本 | >= 18 |
 | 最大子智能体 | 12 个 |
-| Token 预算 | 默认 300k |
+| Token 预算 | 默认 64k |
