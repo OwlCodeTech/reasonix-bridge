@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.*
+.DS_Store
+*.log
+DEEPSEEK_API_KEY
+.npm-cache/
+dist/
+build/

@@ -1,0 +1,11 @@
+{
+  "name": "mcp-bridge-reasonix",
+  "version": "0.16.0",
+  "description": "Sandboxed MCP bridge -- Codex delegates local execution to DeepSeek via function calling.",
+  "type": "module",
+  "private": true,
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "dependencies": { "@modelcontextprotocol/sdk": "^1.13.0", "glob": "^11.0.0" },
+  "engines": { "node": ">=18" }
+}
