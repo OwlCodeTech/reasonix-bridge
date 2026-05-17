@@ -159,6 +159,7 @@ function normalizePlan(plan) {
     if (!p.write_files && p.file) p.write_files = [p.file];
     if (!p.write_files && p.files) p.write_files = p.files;
     if (!p.write_files) p.write_files = [];
+    if (!p.file && p.write_files.length) p.file = p.write_files[0];
     if (!p.read_files) p.read_files = [];
     if (!p.verify) p.verify = [];
     // 兼容指针同步
@@ -631,10 +632,12 @@ async function hEdit(args) {
   }
   const oldHash = crypto.createHash("sha256").update(cur).digest("hex");
   const newContent = cur.replace(sr, rp);
+  if (newContent.length > MAX_WRITE_BYTES) return {error:"Too large."};
+  if (relative(WORKSPACE_ROOT, realpathSync(fp)).startsWith("..")) return {error:"Escaped before write."};
   const newHash = crypto.createHash("sha256").update(newContent).digest("hex");
   await writeFile(fp, newContent, "utf8");
   if (args.force) audit("force_write", {tool:"edit_file",path:stripWS(fp),mode:MODE_NAME,old_hash:oldHash.slice(0,12),new_hash:newHash.slice(0,12)});
-  return {success:true,path:stripWS(fp),old_hash:oldHash.slice(0,12),new_hash:newHash.slice(0,12),changes:sr.length+"->"+rp.length};
+  return {success:true,path:stripWS(fp),old_hash:oldHash.slice(0,12),hash:newHash.slice(0,12),new_hash:newHash.slice(0,12),changes:sr.length+"->"+rp.length};
 }
 
 async function hWrite(args) {
@@ -661,7 +664,7 @@ async function hWrite(args) {
   await writeFile(fp,c,"utf8");
   const newHash = crypto.createHash("sha256").update(c).digest("hex");
   if (args.force) audit("force_write", {tool:"write_file",path:stripWS(fp),mode:MODE_NAME,old_hash:oldH,new_hash:newHash.slice(0,12)});
-  return {success:true,path:stripWS(fp),bytes:c.length,hash:newHash.slice(0,12)};
+  return {success:true,path:stripWS(fp),bytes:c.length,old_hash:oldH,hash:newHash.slice(0,12),new_hash:newHash.slice(0,12)};
 }
 
 // =========================================================================
@@ -866,10 +869,10 @@ async function executeTask(task, context) {
       for (const t of timeline) stepMsg += "- " + t.file + " (" + t.action + ") — " + (t.ok ? "✅" : "⚠️") + "\n";
       stepMsg += "\n";
     }
-    stepMsg += "请完成当前步骤，创建或修改 `" + step.file + "`，然后运行验证命令确认无误。";
+    stepMsg += "请完成当前步骤，创建或修改 `" + targetFiles + "`，然后运行验证命令确认无误。";
 
     const result = await executeOneStep(stepMsg, step, budgetPerStep);
-    timeline.push({ id: step.id, file: step.file, action: step.action, ok: true, turns: result.turns, actions: result.log.slice(0, -1).join("; ") });
+    timeline.push({ id: step.id, file: targetFiles, action: step.action, ok: true, turns: result.turns, actions: result.log.slice(0, -1).join("; ") });
   }
 
   // ════════════════════════════════════════════
@@ -1196,7 +1199,7 @@ server.setRequestHandler(CallToolRequestSchema, async function (req) {
 
           // 构建 prompt（增量 + 智能体通信）
           var p = "## 团队协作\n\n你的身份：" + (SCIENTIST_PROMPT[scientist] || "你是" + scientist + "。") + "\n\n## 任务\n" + (st.action||"") + "\n\n## 文件\n";
-          for (const f of (st.files||[])) {
+          for (const f of (st.write_files||[])) {
             var ex = false; try { ex = existsSync(sandboxPath(f)); } catch(_) {}
             p += "  - " + f + (ex ? " ⚠️ 已存在" : "") + "\n";
           }
